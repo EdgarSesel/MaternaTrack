@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-typecheck:
+    name: Lint & Typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint-typecheck, unit-tests]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: materna_track
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/materna_track
+      NEXTAUTH_SECRET: ci-e2e-secret
+      NEXTAUTH_URL: http://localhost:3000
+      AI_PROVIDER: groq
+      GROQ_API_KEY: ci-placeholder
+      GROQ_MODEL: llama-3.3-70b-versatile
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+
+      - name: Setup Database & Seed
+        run: |
+          npx prisma db push
+          npm run db:seed
+
+      - name: Build Next.js app
+        run: npm run build
+
+      - name: Start Next.js server
+        run: npm run start > /tmp/nextjs.log 2>&1 &
+
+      - name: Wait for server to be ready
+        run: |
+          echo "Waiting for http://localhost:3000..."
+          for i in $(seq 1 30); do
+            # Follow redirects (-L), accept any HTTP status (-f removed),
+            # just check the TCP connection is answering
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/api/health || true)
+            echo "Attempt $i/30 — HTTP status: $STATUS"
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "401" ] || [ "$STATUS" = "302" ]; then
+              echo "Server is ready (status $STATUS)"
+              exit 0
+            fi
+            sleep 3
+          done
+          echo "Server did not start in time. Server log:"
+          cat /tmp/nextjs.log
+          exit 1
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+
+      - name: Print server log on failure
+        if: failure()
+        run: cat /tmp/nextjs.log || echo "No server log found"
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 7
